@@ -11,6 +11,7 @@ namespace raster {
 
 struct NoteRecord {
     std::wstring id;
+    std::wstring title;
     std::wstring text;
     std::vector<TextRange> bold_ranges;
     std::int64_t modified_utc = 0;
@@ -35,6 +36,7 @@ public:
 
     [[nodiscard]] std::wstring RootPath() const;
     [[nodiscard]] static std::wstring DeriveTitle(std::wstring_view text);
+    [[nodiscard]] static std::wstring DisplayTitle(std::wstring_view title);
 
 private:
     [[nodiscard]] std::wstring PathFor(const std::wstring& id) const;

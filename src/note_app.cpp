@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <cwchar>
+#include <cwctype>
 #include <sstream>
 #include <windowsx.h>
 
@@ -23,6 +24,7 @@ constexpr wchar_t kMainClassName[] = L"RasterNoteNativeMainWindow";
 constexpr UINT_PTR kAutoSaveTimerId = 41;
 constexpr UINT_PTR kCaretBlinkTimerId = 42;
 constexpr UINT_PTR kUiAnimationTimerId = 43;
+constexpr std::size_t kMaxTitleLength = 80;
 
 std::int64_t NowUtcSeconds() {
     using namespace std::chrono;
@@ -124,6 +126,112 @@ std::wstring ReadCompositionString(HIMC context, DWORD index) {
     return out;
 }
 
+std::wstring CleanTitleInput(std::wstring_view text, std::size_t max_length) {
+    std::wstring out;
+    out.reserve(std::min<std::size_t>(text.size(), max_length));
+    for (auto ch : text) {
+        if (out.size() >= max_length) {
+            break;
+        }
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') {
+            ch = L' ';
+        }
+        if (ch < 32) {
+            continue;
+        }
+        out.push_back(ch);
+    }
+    return out;
+}
+
+std::wstring NormalizeTitleForCommit(std::wstring_view text) {
+    std::wstring out;
+    out.reserve(std::min<std::size_t>(text.size(), kMaxTitleLength));
+    bool pending_space = false;
+    for (auto ch : text) {
+        if (out.size() >= kMaxTitleLength) {
+            break;
+        }
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') {
+            ch = L' ';
+        }
+        if (ch < 32) {
+            continue;
+        }
+        if (std::iswspace(ch) != 0) {
+            pending_space = !out.empty();
+            continue;
+        }
+        if (pending_space) {
+            out.push_back(L' ');
+            pending_space = false;
+            if (out.size() >= kMaxTitleLength) {
+                break;
+            }
+        }
+        out.push_back(ch);
+    }
+    return out;
+}
+
+std::wstring BuildPreviewText(std::wstring_view text, std::size_t limit) {
+    std::wstring out;
+    out.reserve(std::min<std::size_t>(text.size(), limit));
+    bool previous_space = false;
+
+    for (auto ch : text) {
+        const auto is_space = ch == L'\r' || ch == L'\n' || ch == L'\t' || ch == L' ' || std::iswspace(ch) != 0;
+        if (is_space) {
+            if (!out.empty() && !previous_space) {
+                out.push_back(L' ');
+            }
+            previous_space = true;
+            continue;
+        }
+
+        out.push_back(ch);
+        previous_space = false;
+        if (out.size() >= limit) {
+            break;
+        }
+    }
+
+    while (!out.empty() && std::iswspace(out.back()) != 0) {
+        out.pop_back();
+    }
+    if (out.empty()) {
+        return L"EMPTY NOTE";
+    }
+    return out;
+}
+
+bool SetClipboardText(HWND hwnd, std::wstring_view text) {
+    if (text.empty() || !OpenClipboard(hwnd)) {
+        return false;
+    }
+
+    EmptyClipboard();
+    const auto bytes = (text.size() + 1U) * sizeof(wchar_t);
+    auto* memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) {
+        CloseClipboard();
+        return false;
+    }
+
+    auto* buffer = static_cast<wchar_t*>(GlobalLock(memory));
+    if (!buffer) {
+        GlobalFree(memory);
+        CloseClipboard();
+        return false;
+    }
+    std::memcpy(buffer, text.data(), text.size() * sizeof(wchar_t));
+    buffer[text.size()] = L'\0';
+    GlobalUnlock(memory);
+    SetClipboardData(CF_UNICODETEXT, memory);
+    CloseClipboard();
+    return true;
+}
+
 void DrawButton(ID2D1HwndRenderTarget* target, ID2D1SolidColorBrush* brush, IDWriteTextFormat* format,
                 const D2D1_RECT_F& rect, std::wstring_view label, bool active, bool hovered = false,
                 bool pressed = false, bool focus = false) {
@@ -188,9 +296,6 @@ bool NoteApp::Initialize(HINSTANCE instance, int show_command) {
     }
 
     RefreshRecentNotes();
-    ShowWindow(launcher_hwnd_, SW_SHOWNOACTIVATE);
-    UpdateWindow(launcher_hwnd_);
-
     if (!recent_notes_.empty()) {
         OpenNote(recent_notes_.front().id);
     } else {
@@ -370,6 +475,17 @@ LRESULT NoteApp::HandleLauncherMessage(UINT message, WPARAM wparam, LPARAM lpara
         case WM_SIZE:
             ResizeRenderTarget(launcher_hwnd_);
             return 0;
+        case WM_NCHITTEST: {
+            POINT screen_point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            const auto point = PointFromScreenDip(launcher_hwnd_, screen_point);
+            const auto size = ClientSizeDip(launcher_hwnd_);
+            const auto drag_right = launcher_expanded_ ? size.width - 116.0f : size.width - 16.0f;
+            const auto drag_bottom = launcher_expanded_ ? 46.0f : 30.0f;
+            if (point.x >= 8.0f && point.x <= drag_right && point.y >= 0.0f && point.y <= drag_bottom) {
+                return HTCAPTION;
+            }
+            return HTCLIENT;
+        }
         case WM_ACTIVATE:
             if (LOWORD(wparam) == WA_INACTIVE && launcher_expanded_) {
                 ToggleLauncherExpanded(false);
@@ -391,13 +507,15 @@ LRESULT NoteApp::HandleLauncherMessage(UINT message, WPARAM wparam, LPARAM lpara
                     case HitRole::LauncherToggle:
                         ToggleLauncherExpanded(!launcher_expanded_);
                         return 0;
+                    case HitRole::LauncherResume:
+                        RestoreMainWindow();
+                        return 0;
                     case HitRole::LauncherNew:
                         CreateNewNote();
                         ToggleLauncherExpanded(false);
                         return 0;
                     case HitRole::LauncherQuit:
-                        SaveNow();
-                        DestroyWindow(launcher_hwnd_);
+                        QuitApplication();
                         return 0;
                     case HitRole::LauncherNote:
                         OpenNote(hit.payload);
@@ -419,8 +537,7 @@ LRESULT NoteApp::HandleLauncherMessage(UINT message, WPARAM wparam, LPARAM lpara
             return 0;
         }
         case WM_CLOSE:
-            SaveNow();
-            DestroyWindow(launcher_hwnd_);
+            QuitApplication();
             return 0;
         case WM_DESTROY:
             if (main_hwnd_) {
@@ -458,13 +575,7 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             InvalidateRect(main_hwnd_, nullptr, FALSE);
             return 0;
         case WM_CLOSE:
-            SaveNow();
-            ClearMainHover();
-            ShowWindow(main_hwnd_, SW_HIDE);
-            if (launcher_hwnd_) {
-                ToggleLauncherExpanded(false);
-                ShowWindow(launcher_hwnd_, SW_SHOWNOACTIVATE);
-            }
+            QuitApplication();
             return 0;
         case WM_SETFOCUS:
             StartCaretBlink();
@@ -472,8 +583,10 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             InvalidateRect(main_hwnd_, nullptr, FALSE);
             return 0;
         case WM_KILLFOCUS:
+            CommitTitleEdit();
             StopCaretBlink();
             selecting_ = false;
+            title_selecting_ = false;
             if (GetCapture() == main_hwnd_) {
                 ReleaseCapture();
             }
@@ -517,7 +630,12 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         }
         case WM_MOUSEMOVE: {
             const auto point = PointFromLParamDip(main_hwnd_, lparam);
-            if (selecting_) {
+            if (title_selecting_) {
+                SetTitleCaret(HitTestTitle(point.x, point.y), true);
+                ResetCaretBlink();
+                UpdateImeWindow();
+                InvalidateRect(main_hwnd_, nullptr, FALSE);
+            } else if (selecting_) {
                 document_.SetCaret(HitTestEditor(point.x, point.y), true);
                 ResetCaretBlink();
                 preferred_caret_x_ = -1.0f;
@@ -538,12 +656,25 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             const auto point = PointFromLParamDip(main_hwnd_, lparam);
             const auto layout = BuildMainChromeLayout();
 
+            if (title_editing_ && Hit(layout.title_commit_button, point.x, point.y)) {
+                CommitTitleEdit();
+                return 0;
+            }
+            if (title_editing_ && Hit(layout.title_cancel_button, point.x, point.y)) {
+                CancelTitleEdit();
+                return 0;
+            }
+
             for (const auto& hit : main_hits_) {
                 if (!Hit(hit.rect, point.x, point.y)) {
                     continue;
                 }
 
                 BeginPressedFeedback(hit.role, hit.payload);
+                if (title_editing_ && hit.role != HitRole::MainTitle &&
+                    hit.role != HitRole::MainTitleCommit && hit.role != HitRole::MainTitleCancel) {
+                    CommitTitleEdit();
+                }
                 switch (hit.role) {
                     case HitRole::MainNew:
                         CreateNewNote();
@@ -561,11 +692,26 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                         return 0;
                     }
                     case HitRole::MainSave:
-                        SaveNow();
+                        if (note_dirty_) {
+                            SaveNow();
+                        } else {
+                            SetStatusNotice(current_note_.modified_utc <= 0 ? L"DRAFT NOT SAVED" : L"ALREADY SAVED");
+                        }
                         InvalidateRect(main_hwnd_, nullptr, FALSE);
                         return 0;
                     case HitRole::MainLauncher:
                         ToggleHistoryDrawer(history_drawer_target_ <= 0.0f);
+                        return 0;
+                    case HitRole::MainTitle:
+                        BeginTitleEdit(point.x, point.y);
+                        title_selecting_ = true;
+                        SetCapture(main_hwnd_);
+                        return 0;
+                    case HitRole::MainTitleCommit:
+                        CommitTitleEdit();
+                        return 0;
+                    case HitRole::MainTitleCancel:
+                        CancelTitleEdit();
                         return 0;
                     case HitRole::MainMinimize:
                         ShowWindow(main_hwnd_, SW_MINIMIZE);
@@ -574,13 +720,10 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                         ToggleMainMaximized();
                         return 0;
                     case HitRole::MainClose:
-                        SaveNow();
-                        ClearMainHover();
-                        ShowWindow(main_hwnd_, SW_HIDE);
-                        if (launcher_hwnd_) {
-                            ToggleLauncherExpanded(false);
-                            ShowWindow(launcher_hwnd_, SW_SHOWNOACTIVATE);
-                        }
+                        HideMainToLauncher();
+                        return 0;
+                    case HitRole::MainQuit:
+                        QuitApplication();
                         return 0;
                     case HitRole::MainHistoryNote:
                         OpenNote(hit.payload);
@@ -599,6 +742,17 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                     default:
                         break;
                 }
+            }
+
+            if (Hit(layout.title_rect, point.x, point.y)) {
+                BeginTitleEdit(point.x, point.y);
+                title_selecting_ = true;
+                SetCapture(main_hwnd_);
+                return 0;
+            }
+
+            if (title_editing_) {
+                CommitTitleEdit();
             }
 
             if (history_drawer_progress_ > 0.0f && !Hit(history_drawer_rect_, point.x, point.y)) {
@@ -632,6 +786,12 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             return 0;
         }
         case WM_LBUTTONUP:
+            if (title_selecting_) {
+                title_selecting_ = false;
+                if (GetCapture() == main_hwnd_) {
+                    ReleaseCapture();
+                }
+            }
             if (selecting_) {
                 selecting_ = false;
                 if (GetCapture() == main_hwnd_) {
@@ -639,6 +799,21 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                 }
             }
             return 0;
+        case WM_LBUTTONDBLCLK: {
+            SetFocus(main_hwnd_);
+            const auto point = PointFromLParamDip(main_hwnd_, lparam);
+            const auto layout = BuildMainChromeLayout();
+            if (Hit(layout.title_rect, point.x, point.y)) {
+                BeginTitleEdit(point.x, point.y);
+                SelectTitleAll();
+                title_selecting_ = false;
+                if (GetCapture() == main_hwnd_) {
+                    ReleaseCapture();
+                }
+                return 0;
+            }
+            break;
+        }
         case WM_MOUSEWHEEL: {
             if (history_drawer_progress_ > 0.0f) {
                 POINT screen_point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
@@ -674,6 +849,20 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                 return 0;
             }
 
+            if (title_editing_) {
+                if (wparam == VK_RETURN || wparam == VK_TAB) {
+                    CommitTitleEdit();
+                    InvalidateRect(main_hwnd_, nullptr, FALSE);
+                    return 0;
+                }
+                if (wparam >= 32) {
+                    wchar_t text[2] = {static_cast<wchar_t>(wparam), L'\0'};
+                    InsertTitleText(text);
+                    return 0;
+                }
+                return 0;
+            }
+
             if (wparam == VK_RETURN) {
                 InsertCommittedText(L"\n");
                 return 0;
@@ -693,13 +882,93 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             const auto ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             const auto shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
+            if (title_editing_) {
+                if (ctrl) {
+                    switch (wparam) {
+                        case 'A':
+                            SelectTitleAll();
+                            return 0;
+                        case 'C':
+                            CopyTitleSelectionToClipboard();
+                            return 0;
+                        case 'X':
+                            CutTitleSelectionToClipboard();
+                            return 0;
+                        case 'V':
+                            PasteTitleFromClipboard();
+                            return 0;
+                        case 'S':
+                            CommitTitleEdit();
+                            if (note_dirty_) {
+                                SaveNow();
+                            } else {
+                                SetStatusNotice(current_note_.modified_utc <= 0 ? L"DRAFT NOT SAVED"
+                                                                                 : L"ALREADY SAVED");
+                            }
+                            InvalidateRect(main_hwnd_, nullptr, FALSE);
+                            return 0;
+                        default:
+                            break;
+                    }
+                }
+
+                switch (wparam) {
+                    case VK_LEFT:
+                        MoveTitleCaret(-1, shift);
+                        return 0;
+                    case VK_RIGHT:
+                        MoveTitleCaret(1, shift);
+                        return 0;
+                    case VK_HOME:
+                        SetTitleCaret(0, shift);
+                        ResetCaretBlink();
+                        UpdateImeWindow();
+                        InvalidateRect(main_hwnd_, nullptr, FALSE);
+                        return 0;
+                    case VK_END:
+                        SetTitleCaret(title_edit_text_.size(), shift);
+                        ResetCaretBlink();
+                        UpdateImeWindow();
+                        InvalidateRect(main_hwnd_, nullptr, FALSE);
+                        return 0;
+                    case VK_BACK:
+                        DeleteTitleBackward();
+                        return 0;
+                    case VK_DELETE:
+                        DeleteTitleForward();
+                        return 0;
+                    case VK_RETURN:
+                    case VK_TAB:
+                    case VK_DOWN:
+                        CommitTitleEdit();
+                        InvalidateRect(main_hwnd_, nullptr, FALSE);
+                        return 0;
+                    case VK_ESCAPE:
+                        CancelTitleEdit();
+                        InvalidateRect(main_hwnd_, nullptr, FALSE);
+                        return 0;
+                    default:
+                        break;
+                }
+
+                if (ctrl) {
+                    CommitTitleEdit();
+                } else {
+                    return 0;
+                }
+            }
+
             if (ctrl) {
                 switch (wparam) {
                     case 'N':
                         CreateNewNote();
                         return 0;
                     case 'S':
-                        SaveNow();
+                        if (note_dirty_) {
+                            SaveNow();
+                        } else {
+                            SetStatusNotice(current_note_.modified_utc <= 0 ? L"DRAFT NOT SAVED" : L"ALREADY SAVED");
+                        }
                         InvalidateRect(main_hwnd_, nullptr, FALSE);
                         return 0;
                     case 'B': {
@@ -826,11 +1095,7 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                     } else if (launcher_expanded_) {
                         ToggleLauncherExpanded(false);
                     } else {
-                        ShowWindow(main_hwnd_, SW_HIDE);
-                        if (launcher_hwnd_) {
-                            ToggleLauncherExpanded(false);
-                            ShowWindow(launcher_hwnd_, SW_SHOWNOACTIVATE);
-                        }
+                        HideMainToLauncher();
                     }
                     return 0;
                 default:
@@ -839,9 +1104,13 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             break;
         }
         case WM_IME_STARTCOMPOSITION:
-            ime_preview_.clear();
+            if (title_editing_) {
+                title_ime_preview_.clear();
+            } else {
+                ime_preview_.clear();
+                InvalidateLayout();
+            }
             ResetCaretBlink();
-            InvalidateLayout();
             UpdateImeWindow();
             InvalidateRect(main_hwnd_, nullptr, FALSE);
             return 0;
@@ -849,9 +1118,13 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             HandleImeComposition(lparam);
             return 0;
         case WM_IME_ENDCOMPOSITION:
-            ime_preview_.clear();
+            if (title_editing_) {
+                title_ime_preview_.clear();
+            } else {
+                ime_preview_.clear();
+                InvalidateLayout();
+            }
             ResetCaretBlink();
-            InvalidateLayout();
             InvalidateRect(main_hwnd_, nullptr, FALSE);
             return 0;
         case WM_IME_CHAR:
@@ -885,85 +1158,185 @@ void NoteApp::RenderLauncher() {
     launcher_hits_.clear();
     const auto size = ClientSizeDip(launcher_hwnd_);
     const auto root = D2D1::RectF(0.0f, 0.0f, size.width, size.height);
-    const auto header = D2D1::RectF(0.0f, 0.0f, size.width, 54.0f);
-    const auto toggle_rect = D2D1::RectF(size.width - 92.0f, 12.0f, size.width - 14.0f, 44.0f);
+    const auto current_title = NoteStore::DisplayTitle(current_note_.title);
+    const auto current_preview = BuildPreviewText(document_.Text(), launcher_expanded_ ? 220 : 96);
+    const auto current_is_draft = current_note_.modified_utc <= 0;
+    const std::wstring current_state = current_note_.id.empty()
+                                           ? L"No note loaded"
+                                           : (current_is_draft ? L"Draft not saved"
+                                                               : (note_dirty_ ? L"Unsaved changes" : L"Saved locally"));
+    const auto status_color = current_is_draft || note_dirty_ ? D2D1::ColorF(0x8B6B2E, 1.0f)
+                                                              : D2D1::ColorF(0x2F6B4F, 1.0f);
 
     launcher_target_->BeginDraw();
-    launcher_target_->Clear(theme::Paper());
+    launcher_target_->Clear(theme::Panel());
 
     launcher_brush_->SetColor(theme::Border());
     launcher_target_->DrawRectangle(root, launcher_brush_.Get(), 1.0f);
-    launcher_target_->DrawLine(D2D1::Point2F(0.0f, header.bottom), D2D1::Point2F(size.width, header.bottom),
-                               launcher_brush_.Get(), 1.0f);
-
-    launcher_brush_->SetColor(theme::Ink());
-    const auto label_rect = D2D1::RectF(16.0f, 10.0f, size.width - 110.0f, 26.0f);
-    launcher_target_->DrawText(L"RASTER NOTE FLOAT", _countof(L"RASTER NOTE FLOAT") - 1, label_format_.Get(),
-                               label_rect, launcher_brush_.Get());
-
-    DrawButton(launcher_target_.Get(), launcher_brush_.Get(), meta_format_.Get(), toggle_rect,
-               launcher_expanded_ ? L"CLOSE" : L"OPEN", launcher_expanded_);
-    launcher_hits_.push_back({toggle_rect, HitRole::LauncherToggle, {}});
+    launcher_brush_->SetColor(status_color);
+    launcher_target_->FillRectangle(D2D1::RectF(0.0f, 0.0f, 5.0f, size.height), launcher_brush_.Get());
 
     if (!launcher_expanded_) {
-        const std::wstring preview =
-            recent_notes_.empty() ? L"OPEN TO REVEAL RECENT NOTES" : recent_notes_.front().title;
+        const auto open_rect = D2D1::RectF(92.0f, 14.0f, 140.0f, 38.0f);
+        const auto more_rect = D2D1::RectF(146.0f, 14.0f, 194.0f, 38.0f);
+        const auto exit_rect = D2D1::RectF(200.0f, 14.0f, 240.0f, 38.0f);
+        const auto content_rect = D2D1::RectF(20.0f, 44.0f, size.width - 20.0f, 100.0f);
+        const auto preview_rect = D2D1::RectF(20.0f, 74.0f, size.width - 20.0f, 98.0f);
+        const auto state_rect = D2D1::RectF(20.0f, 106.0f, size.width - 20.0f, 124.0f);
+        const auto main_visible = main_hwnd_ && IsWindowVisible(main_hwnd_) != FALSE;
+
+        launcher_brush_->SetColor(theme::Ink());
+        const auto label = L"RASTER NOTE";
+        launcher_target_->DrawText(label, _countof(L"RASTER NOTE") - 1, label_format_.Get(),
+                                   D2D1::RectF(20.0f, 16.0f, open_rect.left - 10.0f, 34.0f),
+                                   launcher_brush_.Get());
+        launcher_brush_->SetColor(theme::Ink());
+        launcher_target_->DrawText(current_title.c_str(), static_cast<UINT32>(current_title.size()),
+                                   section_format_.Get(),
+                                   D2D1::RectF(content_rect.left, content_rect.top, content_rect.right,
+                                               content_rect.top + 28.0f),
+                                   launcher_brush_.Get());
+
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), open_rect,
+                   main_visible ? L"FOCUS" : L"OPEN", false);
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), more_rect, L"MORE", false);
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), exit_rect, L"EXIT", false);
+        launcher_hits_.push_back({open_rect, HitRole::LauncherResume, {}});
+        launcher_hits_.push_back({more_rect, HitRole::LauncherToggle, {}});
+        launcher_hits_.push_back({exit_rect, HitRole::LauncherQuit, {}});
+        launcher_hits_.push_back({content_rect, HitRole::LauncherToggle, {}});
         launcher_brush_->SetColor(theme::Dim());
-        const auto preview_rect = D2D1::RectF(16.0f, 50.0f, size.width - 16.0f, size.height - 10.0f);
-        launcher_target_->DrawText(preview.c_str(), static_cast<UINT32>(preview.size()), meta_format_.Get(),
-                                   preview_rect, launcher_brush_.Get());
+        launcher_target_->DrawText(current_preview.c_str(), static_cast<UINT32>(current_preview.size()),
+                                   meta_format_.Get(), preview_rect, launcher_brush_.Get());
+        launcher_brush_->SetColor(status_color);
+        launcher_target_->DrawText(current_state.c_str(), static_cast<UINT32>(current_state.size()),
+                                   meta_format_.Get(), state_rect, launcher_brush_.Get());
     } else {
+        const auto header_rect = D2D1::RectF(0.0f, 0.0f, size.width, 70.0f);
+        const auto close_rect = D2D1::RectF(136.0f, 18.0f, 188.0f, 52.0f);
+        const auto header_exit_rect = D2D1::RectF(194.0f, 18.0f, 240.0f, 52.0f);
+        launcher_brush_->SetColor(theme::Paper());
+        launcher_target_->FillRectangle(header_rect, launcher_brush_.Get());
+        launcher_brush_->SetColor(theme::Border());
+        launcher_target_->DrawLine(D2D1::Point2F(0.0f, header_rect.bottom), D2D1::Point2F(size.width, header_rect.bottom),
+                                   launcher_brush_.Get(), 1.0f);
+
+        launcher_brush_->SetColor(theme::Ink());
+        launcher_target_->DrawText(L"RASTER NOTE", _countof(L"RASTER NOTE") - 1, label_format_.Get(),
+                                   D2D1::RectF(22.0f, 16.0f, size.width - 120.0f, 32.0f), launcher_brush_.Get());
+        launcher_brush_->SetColor(theme::Dim());
+        launcher_target_->DrawText(L"Current + recent", _countof(L"Current + recent") - 1, meta_format_.Get(),
+                                   D2D1::RectF(22.0f, 36.0f, close_rect.left - 10.0f, 54.0f), launcher_brush_.Get());
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), close_rect, L"LESS", true);
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), header_exit_rect, L"EXIT", false);
+        launcher_hits_.push_back({close_rect, HitRole::LauncherToggle, {}});
+        launcher_hits_.push_back({header_exit_rect, HitRole::LauncherQuit, {}});
+
+        launcher_brush_->SetColor(theme::Dim());
+        launcher_target_->DrawText(L"CURRENT NOTE", _countof(L"CURRENT NOTE") - 1, label_format_.Get(),
+                                   D2D1::RectF(22.0f, 86.0f, size.width - 22.0f, 102.0f), launcher_brush_.Get());
+
+        const auto current_row = D2D1::RectF(22.0f, 108.0f, size.width - 22.0f, 236.0f);
+        const auto current_open_rect = D2D1::RectF(180.0f, current_row.top + 12.0f, 236.0f,
+                                                   current_row.top + 44.0f);
+        launcher_brush_->SetColor(theme::Card());
+        launcher_target_->FillRectangle(current_row, launcher_brush_.Get());
+        launcher_brush_->SetColor(theme::Border());
+        launcher_target_->DrawRectangle(current_row, launcher_brush_.Get(), 1.0f);
+        launcher_brush_->SetColor(theme::Ink());
+        launcher_target_->DrawText(current_title.c_str(), static_cast<UINT32>(current_title.size()),
+                                   section_format_.Get(),
+                                   D2D1::RectF(current_row.left + 12.0f, current_row.top + 12.0f,
+                                               current_open_rect.left - 10.0f, current_row.top + 40.0f),
+                                   launcher_brush_.Get());
+        launcher_brush_->SetColor(status_color);
+        launcher_target_->DrawText(current_state.c_str(), static_cast<UINT32>(current_state.size()),
+                                   meta_format_.Get(),
+                                   D2D1::RectF(current_row.left + 12.0f, current_row.top + 44.0f,
+                                               current_open_rect.left - 10.0f, current_row.top + 62.0f),
+                                   launcher_brush_.Get());
+        launcher_brush_->SetColor(theme::Dim());
+        launcher_target_->DrawText(current_preview.c_str(), static_cast<UINT32>(current_preview.size()),
+                                   meta_format_.Get(),
+                                   D2D1::RectF(current_row.left + 12.0f, current_row.top + 68.0f,
+                                               current_row.right - 12.0f, current_row.bottom - 12.0f),
+                                   launcher_brush_.Get());
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), current_open_rect,
+                   L"OPEN", false);
+        launcher_hits_.push_back({current_open_rect, HitRole::LauncherResume, {}});
+
+        float top = current_row.bottom + 44.0f;
         launcher_brush_->SetColor(theme::Dim());
         launcher_target_->DrawText(L"RECENT", _countof(L"RECENT") - 1, label_format_.Get(),
-                                   D2D1::RectF(16.0f, 64.0f, 120.0f, 80.0f), launcher_brush_.Get());
+                                   D2D1::RectF(22.0f, top - 22.0f, 120.0f, top - 4.0f), launcher_brush_.Get());
+        const auto quick_new_rect = D2D1::RectF(180.0f, top - 34.0f, 236.0f, top - 8.0f);
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), quick_new_rect, L"NEW", false);
+        launcher_hits_.push_back({quick_new_rect, HitRole::LauncherNew, {}});
 
-        float top = 84.0f;
-        if (recent_notes_.empty()) {
-            launcher_brush_->SetColor(theme::Hint());
-            const auto empty_rect = D2D1::RectF(16.0f, top + 12.0f, size.width - 16.0f, top + 80.0f);
-            launcher_target_->DrawText(L"NO NOTES YET. CREATE THE FIRST ONE.",
-                                       _countof(L"NO NOTES YET. CREATE THE FIRST ONE.") - 1, meta_format_.Get(),
-                                       empty_rect, launcher_brush_.Get());
-        } else {
-            const auto visible_count = std::min<std::size_t>(recent_notes_.size(), 6);
-            for (std::size_t i = 0; i < visible_count; ++i) {
-                const auto& note = recent_notes_[i];
-                const auto row = D2D1::RectF(16.0f, top, size.width - 16.0f, top + theme::kListRowHeight);
-                launcher_brush_->SetColor(note.id == current_note_.id ? theme::Selection() : theme::Panel());
-                launcher_target_->FillRectangle(row, launcher_brush_.Get());
-                launcher_brush_->SetColor(theme::Border());
-                launcher_target_->DrawRectangle(row, launcher_brush_.Get(), 1.0f);
-
-                launcher_brush_->SetColor(theme::Ink());
-                const auto title_rect = D2D1::RectF(row.left + 10.0f, row.top + 6.0f, row.right - 10.0f,
-                                                    row.top + 28.0f);
-                launcher_target_->DrawText(note.title.c_str(), static_cast<UINT32>(note.title.size()),
-                                           meta_format_.Get(), title_rect, launcher_brush_.Get());
-
-                launcher_brush_->SetColor(theme::Dim());
-                const auto preview_rect =
-                    D2D1::RectF(row.left + 10.0f, row.top + 24.0f, row.right - 100.0f, row.bottom - 8.0f);
-                launcher_target_->DrawText(note.preview.c_str(), static_cast<UINT32>(note.preview.size()),
-                                           meta_format_.Get(), preview_rect, launcher_brush_.Get());
-
-                const auto time_string = FormatTimestamp(note.modified_utc);
-                const auto time_rect =
-                    D2D1::RectF(row.right - 92.0f, row.top + 24.0f, row.right - 10.0f, row.bottom - 8.0f);
-                launcher_target_->DrawText(time_string.c_str(), static_cast<UINT32>(time_string.size()),
-                                           meta_format_.Get(), time_rect, launcher_brush_.Get());
-
-                launcher_hits_.push_back({row, HitRole::LauncherNote, note.id});
-                top += theme::kListRowHeight + 8.0f;
+        bool drew_recent = false;
+        for (const auto& note : recent_notes_) {
+            if (note.id == current_note_.id) {
+                continue;
             }
+            if (top + theme::kListRowHeight > size.height - 76.0f) {
+                break;
+            }
+            drew_recent = true;
+            const auto row = D2D1::RectF(22.0f, top, size.width - 22.0f, top + theme::kListRowHeight);
+            launcher_brush_->SetColor(theme::Card());
+            launcher_target_->FillRectangle(row, launcher_brush_.Get());
+            launcher_brush_->SetColor(theme::Border());
+            launcher_target_->DrawRectangle(row, launcher_brush_.Get(), 1.0f);
+
+            launcher_brush_->SetColor(theme::Ink());
+            const auto title_rect = D2D1::RectF(row.left + 10.0f, row.top + 6.0f, row.right - 10.0f,
+                                                row.top + 28.0f);
+            launcher_target_->DrawText(note.title.c_str(), static_cast<UINT32>(note.title.size()),
+                                       meta_format_.Get(), title_rect, launcher_brush_.Get());
+
+            launcher_brush_->SetColor(theme::Dim());
+            const auto preview_rect =
+                D2D1::RectF(row.left + 10.0f, row.top + 24.0f, row.right - 100.0f, row.bottom - 8.0f);
+            launcher_target_->DrawText(note.preview.c_str(), static_cast<UINT32>(note.preview.size()),
+                                       meta_format_.Get(), preview_rect, launcher_brush_.Get());
+
+            const auto time_string = FormatTimestamp(note.modified_utc);
+            const auto time_rect =
+                D2D1::RectF(row.right - 92.0f, row.top + 24.0f, row.right - 10.0f, row.bottom - 8.0f);
+            launcher_target_->DrawText(time_string.c_str(), static_cast<UINT32>(time_string.size()),
+                                       meta_format_.Get(), time_rect, launcher_brush_.Get());
+
+            launcher_hits_.push_back({row, HitRole::LauncherNote, note.id});
+            top += theme::kListRowHeight + 8.0f;
         }
 
-        const auto new_rect = D2D1::RectF(16.0f, size.height - 52.0f, 132.0f, size.height - 16.0f);
-        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), meta_format_.Get(), new_rect, L"NEW NOTE", false);
+        if (!drew_recent) {
+            const auto empty_rect = D2D1::RectF(22.0f, top, size.width - 22.0f, top + 58.0f);
+            launcher_brush_->SetColor(theme::Card());
+            launcher_target_->FillRectangle(empty_rect, launcher_brush_.Get());
+            launcher_brush_->SetColor(theme::Border());
+            launcher_target_->DrawRectangle(empty_rect, launcher_brush_.Get(), 1.0f);
+            launcher_brush_->SetColor(theme::Hint());
+            launcher_target_->DrawText(L"NO OTHER SAVED NOTES.",
+                                       _countof(L"NO OTHER SAVED NOTES.") - 1, meta_format_.Get(),
+                                       D2D1::RectF(empty_rect.left + 12.0f, empty_rect.top + 20.0f,
+                                                   empty_rect.right - 12.0f, empty_rect.bottom - 12.0f),
+                                       launcher_brush_.Get());
+        }
+
+        const auto footer_rect = D2D1::RectF(0.0f, size.height - 68.0f, size.width, size.height);
+        launcher_brush_->SetColor(theme::Paper());
+        launcher_target_->FillRectangle(footer_rect, launcher_brush_.Get());
+        launcher_brush_->SetColor(theme::Border());
+        launcher_target_->DrawLine(D2D1::Point2F(0.0f, footer_rect.top), D2D1::Point2F(size.width, footer_rect.top),
+                                   launcher_brush_.Get(), 1.0f);
+
+        const auto new_rect = D2D1::RectF(22.0f, size.height - 50.0f, 146.0f, size.height - 16.0f);
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), new_rect, L"NEW", false);
         launcher_hits_.push_back({new_rect, HitRole::LauncherNew, {}});
 
-        const auto quit_rect = D2D1::RectF(size.width - 96.0f, size.height - 52.0f, size.width - 16.0f,
-                                           size.height - 16.0f);
-        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), meta_format_.Get(), quit_rect, L"EXIT", false);
+        const auto quit_rect = D2D1::RectF(178.0f, size.height - 50.0f, 236.0f, size.height - 16.0f);
+        DrawButton(launcher_target_.Get(), launcher_brush_.Get(), button_format_.Get(), quit_rect, L"EXIT", false);
         launcher_hits_.push_back({quit_rect, HitRole::LauncherQuit, {}});
     }
 
@@ -989,21 +1362,35 @@ void NoteApp::RenderMain() {
     main_hits_.clear();
 
     const auto layout = BuildMainChromeLayout();
-    const auto title = NoteStore::DeriveTitle(document_.Text());
+    const auto title = NoteStore::DisplayTitle(current_note_.title);
     const auto bold_active = document_.HasSelection()
                                  ? document_.IsRangeFullyBold(document_.SelectionStart(),
                                                               document_.SelectionEnd() - document_.SelectionStart())
                                  : document_.PendingBold();
     const auto maximized = IsMainMaximized();
-    const std::wstring subtitle =
-        note_dirty_ ? L"LOCAL NOTE STORE / UNSAVED / CTRL+S TO COMMIT"
-                    : L"LOCAL NOTE STORE / AUTOSAVE READY / CTRL+B TOGGLE";
-    const std::wstring editor_meta_left = L"PLAIN TEXT / BOLD ONLY";
-    const std::wstring editor_meta_right = L"CTRL+H NOTES / CTRL+B / CTRL+S";
-    const std::wstring footer_left = L"LOCAL FILE";
+    const auto is_draft = current_note_.modified_utc <= 0;
+    const std::wstring lifecycle = is_draft ? L"DRAFT" : (note_dirty_ ? L"UNSAVED" : L"SAVED");
+    const std::wstring utility_label = L"RASTER NOTE / " + lifecycle + L" / NATIVE";
+    const std::wstring subtitle = is_draft
+                                      ? L"DRAFT NOTE / LOCAL FILE CREATED AFTER FIRST SAVE"
+                                      : (note_dirty_ ? L"LOCAL NOTE STORE / AUTOSAVE PENDING"
+                                                     : L"LOCAL NOTE STORE / SAVED AND READY");
+    const std::wstring editor_meta_left = is_draft ? L"DRAFT / PLAIN TEXT / BOLD ONLY"
+                                                   : L"LOCAL FILE / PLAIN TEXT / BOLD ONLY";
+    std::wstringstream editor_meta_right_stream;
+    editor_meta_right_stream << recent_notes_.size() << L" SAVED NOTES";
+    const auto editor_meta_right = editor_meta_right_stream.str();
+    const std::wstring footer_left =
+        !status_notice_.empty()
+            ? status_notice_
+            : (is_draft ? L"DRAFT NOT SAVED" : (note_dirty_ ? L"UNSAVED CHANGES" : L"SAVED LOCALLY"));
     std::wstringstream footer_right_stream;
-    footer_right_stream << L"CHARS " << document_.Length() << L"    SAVED "
-                        << FormatTimestamp(current_note_.modified_utc);
+    footer_right_stream << L"CHARS " << document_.Length() << L"    ";
+    if (is_draft) {
+        footer_right_stream << L"CREATED AFTER FIRST SAVE";
+    } else {
+        footer_right_stream << L"SAVED " << FormatTimestamp(current_note_.modified_utc);
+    }
     const auto footer_right = footer_right_stream.str();
     const auto main_focused = GetFocus() == main_hwnd_;
 
@@ -1042,13 +1429,124 @@ void NoteApp::RenderMain() {
                            main_brush_.Get(), 1.0f);
 
     main_brush_->SetColor(theme::Dim());
-    main_target_->DrawText(L"MAIN WINDOW / FRAMELESS / NATIVE",
-                           _countof(L"MAIN WINDOW / FRAMELESS / NATIVE") - 1, label_format_.Get(),
+    main_target_->DrawText(utility_label.c_str(), static_cast<UINT32>(utility_label.size()), label_format_.Get(),
                            layout.utility_rect, main_brush_.Get());
 
     main_brush_->SetColor(theme::Ink());
-    main_target_->DrawText(title.c_str(), static_cast<UINT32>(title.size()), section_format_.Get(),
-                           layout.title_rect, main_brush_.Get());
+    if (title_editing_) {
+        main_brush_->SetColor(WithAlpha(theme::Accent(), 0.09f));
+        main_target_->FillRectangle(layout.title_rect, main_brush_.Get());
+        main_brush_->SetColor(theme::Accent());
+        main_target_->DrawRectangle(layout.title_rect, main_brush_.Get(), 1.0f);
+    } else if (IsMainHovered(HitRole::MainTitle)) {
+        main_brush_->SetColor(WithAlpha(theme::Selection(), 0.42f));
+        main_target_->FillRectangle(layout.title_rect, main_brush_.Get());
+        main_brush_->SetColor(theme::Border());
+        main_target_->DrawRectangle(layout.title_rect, main_brush_.Get(), 1.0f);
+    } else {
+        main_brush_->SetColor(theme::SoftBorder());
+        main_target_->DrawLine(D2D1::Point2F(layout.title_rect.left, layout.title_rect.bottom),
+                               D2D1::Point2F(layout.title_rect.right, layout.title_rect.bottom),
+                               main_brush_.Get(), 1.0f);
+    }
+
+    if (title_editing_) {
+        const auto edit_text = TitleLayoutText();
+        const auto title_layout = CreateTitleLayout(edit_text);
+        if (title_layout) {
+            const auto origin = D2D1::Point2F(layout.title_text_rect.left, layout.title_text_rect.top);
+            if (TitleHasSelection()) {
+                const auto preview_length = title_ime_preview_.size();
+                const auto map_to_display = [&](std::size_t position) {
+                    if (preview_length != 0 && position > title_caret_) {
+                        return position + preview_length;
+                    }
+                    return position;
+                };
+                const auto selection_start = map_to_display(TitleSelectionStart());
+                const auto selection_end = map_to_display(TitleSelectionEnd());
+                UINT32 hit_count = 0;
+                title_layout->HitTestTextRange(static_cast<UINT32>(selection_start),
+                                               static_cast<UINT32>(selection_end - selection_start),
+                                               0.0f, 0.0f, nullptr, 0, &hit_count);
+                std::vector<DWRITE_HIT_TEST_METRICS> hits(hit_count);
+                if (hit_count != 0) {
+                    title_layout->HitTestTextRange(static_cast<UINT32>(selection_start),
+                                                   static_cast<UINT32>(selection_end - selection_start),
+                                                   0.0f, 0.0f, hits.data(), hit_count, &hit_count);
+                    main_brush_->SetColor(WithAlpha(theme::Accent(), 0.18f));
+                    for (UINT32 i = 0; i < hit_count; ++i) {
+                        const auto& hit = hits[i];
+                        main_target_->FillRectangle(
+                            D2D1::RectF(origin.x + hit.left, origin.y + hit.top,
+                                        origin.x + hit.left + hit.width, origin.y + hit.top + hit.height),
+                            main_brush_.Get());
+                    }
+                }
+            }
+
+            if (title_edit_text_.empty() && title_ime_preview_.empty()) {
+                const std::wstring placeholder = L"UNTITLED";
+                main_brush_->SetColor(theme::Hint());
+                main_target_->DrawText(placeholder.c_str(), static_cast<UINT32>(placeholder.size()),
+                                       section_format_.Get(), layout.title_text_rect, main_brush_.Get());
+            } else {
+                main_brush_->SetColor(theme::Ink());
+                main_target_->DrawTextLayout(origin, title_layout.Get(), main_brush_.Get());
+            }
+
+            if (!title_ime_preview_.empty()) {
+                UINT32 hit_count = 0;
+                title_layout->HitTestTextRange(static_cast<UINT32>(title_caret_),
+                                               static_cast<UINT32>(title_ime_preview_.size()), 0.0f, 0.0f,
+                                               nullptr, 0, &hit_count);
+                std::vector<DWRITE_HIT_TEST_METRICS> hits(hit_count);
+                if (hit_count != 0) {
+                    title_layout->HitTestTextRange(static_cast<UINT32>(title_caret_),
+                                                   static_cast<UINT32>(title_ime_preview_.size()), 0.0f, 0.0f,
+                                                   hits.data(), hit_count, &hit_count);
+                    main_brush_->SetColor(theme::Accent());
+                    for (UINT32 i = 0; i < hit_count; ++i) {
+                        const auto& hit = hits[i];
+                        const auto y = origin.y + hit.top + hit.height - 2.0f;
+                        main_target_->DrawLine(D2D1::Point2F(origin.x + hit.left, y),
+                                               D2D1::Point2F(origin.x + hit.left + hit.width, y),
+                                               main_brush_.Get(), 1.0f);
+                    }
+                }
+            }
+
+            float caret_x = 0.0f;
+            float caret_y = 0.0f;
+            DWRITE_HIT_TEST_METRICS metrics{};
+            const auto text_length = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(edit_text.size()));
+            const auto display_caret = std::min<std::uint32_t>(
+                static_cast<std::uint32_t>(title_caret_ + title_ime_preview_.size()), text_length);
+            HitTestCaret(title_layout.Get(), display_caret, text_length, &caret_x, &caret_y, &metrics);
+            main_brush_->SetColor(theme::Accent());
+            if (main_focused && caret_visible_) {
+                main_target_->FillRectangle(
+                    D2D1::RectF(origin.x + caret_x, origin.y + caret_y,
+                                origin.x + caret_x + theme::kCaretWidth, origin.y + caret_y + metrics.height),
+                    main_brush_.Get());
+            }
+        }
+    } else {
+        main_brush_->SetColor(theme::Ink());
+        main_target_->DrawText(title.c_str(), static_cast<UINT32>(title.size()), section_format_.Get(),
+                               layout.title_text_rect, main_brush_.Get());
+    }
+
+    if (title_editing_) {
+        const auto changed = NormalizeTitleForCommit(title_edit_text_) != current_note_.title;
+        DrawButton(main_target_.Get(), main_brush_.Get(), button_format_.Get(), layout.title_commit_button,
+                   L"OK", changed, IsMainHovered(HitRole::MainTitleCommit),
+                   IsPressedFeedback(HitRole::MainTitleCommit), main_focused);
+        DrawButton(main_target_.Get(), main_brush_.Get(), button_format_.Get(), layout.title_cancel_button,
+                   L"CANCEL", false, IsMainHovered(HitRole::MainTitleCancel),
+                   IsPressedFeedback(HitRole::MainTitleCancel));
+    }
+
     main_brush_->SetColor(theme::Dim());
     main_target_->DrawText(subtitle.c_str(), static_cast<UINT32>(subtitle.size()), meta_format_.Get(),
                            layout.subtitle_rect, main_brush_.Get());
@@ -1068,16 +1566,24 @@ void NoteApp::RenderMain() {
     DrawButton(main_target_.Get(), main_brush_.Get(), button_format_.Get(), layout.maximize_button,
                maximized ? L"REST" : L"MAX", false, IsMainHovered(HitRole::MainMaximize),
                IsPressedFeedback(HitRole::MainMaximize));
-    DrawButton(main_target_.Get(), main_brush_.Get(), button_format_.Get(), layout.close_button, L"HIDE", false,
+    DrawButton(main_target_.Get(), main_brush_.Get(), button_format_.Get(), layout.close_button, L"FLOAT", false,
                IsMainHovered(HitRole::MainClose), IsPressedFeedback(HitRole::MainClose));
+    DrawButton(main_target_.Get(), main_brush_.Get(), button_format_.Get(), layout.quit_button, L"EXIT", false,
+               IsMainHovered(HitRole::MainQuit), IsPressedFeedback(HitRole::MainQuit));
 
     main_hits_.push_back({layout.new_button, HitRole::MainNew, {}});
     main_hits_.push_back({layout.bold_button, HitRole::MainBold, {}});
     main_hits_.push_back({layout.save_button, HitRole::MainSave, {}});
     main_hits_.push_back({layout.launcher_button, HitRole::MainLauncher, {}});
+    main_hits_.push_back({layout.title_rect, HitRole::MainTitle, {}});
+    if (title_editing_) {
+        main_hits_.push_back({layout.title_commit_button, HitRole::MainTitleCommit, {}});
+        main_hits_.push_back({layout.title_cancel_button, HitRole::MainTitleCancel, {}});
+    }
     main_hits_.push_back({layout.minimize_button, HitRole::MainMinimize, {}});
     main_hits_.push_back({layout.maximize_button, HitRole::MainMaximize, {}});
     main_hits_.push_back({layout.close_button, HitRole::MainClose, {}});
+    main_hits_.push_back({layout.quit_button, HitRole::MainQuit, {}});
 
     main_brush_->SetColor(theme::Dim());
     const auto editor_meta_left_rect =
@@ -1129,11 +1635,15 @@ void NoteApp::RenderMain() {
 
     if (layout_text_.empty() && ime_preview_.empty()) {
         main_brush_->SetColor(theme::Hint());
-        const auto hint_rect = D2D1::RectF(editor_rect_.left + 12.0f, editor_rect_.top + 38.0f,
-                                           editor_rect_.right - 12.0f, editor_rect_.top + 58.0f);
-        main_target_->DrawText(L"Press Ctrl+B for bold. Autosave is enabled.",
-                               _countof(L"Press Ctrl+B for bold. Autosave is enabled.") - 1, meta_format_.Get(),
-                               hint_rect, main_brush_.Get());
+        const auto hint_title_rect = D2D1::RectF(editor_rect_.left + 12.0f, editor_rect_.top + 38.0f,
+                                                 editor_rect_.right - 12.0f, editor_rect_.top + 64.0f);
+        const auto hint_body_rect = D2D1::RectF(editor_rect_.left + 12.0f, editor_rect_.top + 66.0f,
+                                                editor_rect_.right - 12.0f, editor_rect_.top + 88.0f);
+        main_target_->DrawText(L"Untitled draft", _countof(L"Untitled draft") - 1,
+                               section_format_.Get(), hint_title_rect, main_brush_.Get());
+        main_target_->DrawText(L"No content yet.",
+                               _countof(L"No content yet.") - 1, meta_format_.Get(),
+                               hint_body_rect, main_brush_.Get());
     }
 
     if (main_focused && caret_visible_ && text_layout_) {
@@ -1199,7 +1709,7 @@ void NoteApp::RenderMain() {
                                1.0f);
 
         const std::wstring drawer_title = L"RECENT / LOCAL";
-        const std::wstring drawer_hint = L"ESC CLOSE";
+        const std::wstring drawer_hint = L"LOCAL FILES";
         std::wstringstream drawer_count_stream;
         drawer_count_stream << recent_notes_.size() << L" NOTES";
         const auto drawer_count = drawer_count_stream.str();
@@ -1534,6 +2044,42 @@ void NoteApp::UpdateImeWindow() {
         return;
     }
 
+    if (title_editing_) {
+        const auto text = TitleLayoutText();
+        const auto title_layout = CreateTitleLayout(text);
+        if (!title_layout) {
+            return;
+        }
+
+        float caret_x = 0.0f;
+        float caret_y = 0.0f;
+        DWRITE_HIT_TEST_METRICS metrics{};
+        const auto text_length = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(text.size()));
+        const auto display_caret = std::min<std::uint32_t>(
+            static_cast<std::uint32_t>(title_caret_ + title_ime_preview_.size()), text_length);
+        HitTestCaret(title_layout.Get(), display_caret, text_length, &caret_x, &caret_y, &metrics);
+
+        const auto layout = BuildMainChromeLayout();
+        const auto scale = ScaleFor(main_hwnd_);
+        POINT caret_point{DipToPx(layout.title_text_rect.left + caret_x, scale),
+                          DipToPx(layout.title_text_rect.top + caret_y + metrics.height, scale)};
+
+        if (auto* context = ImmGetContext(main_hwnd_)) {
+            COMPOSITIONFORM composition{};
+            composition.dwStyle = CFS_POINT;
+            composition.ptCurrentPos = caret_point;
+            ImmSetCompositionWindow(context, &composition);
+
+            CANDIDATEFORM candidate{};
+            candidate.dwStyle = CFS_CANDIDATEPOS;
+            candidate.dwIndex = 0;
+            candidate.ptCurrentPos = caret_point;
+            ImmSetCandidateWindow(context, &candidate);
+            ImmReleaseContext(main_hwnd_, context);
+        }
+        return;
+    }
+
     EnsureTextLayout();
     if (!text_layout_) {
         return;
@@ -1581,13 +2127,28 @@ void NoteApp::SaveNow() {
         KillTimer(main_hwnd_, kAutoSaveTimerId);
     }
 
-    SyncCurrentNoteFromDocument();
-    current_note_.modified_utc = NowUtcSeconds();
-    if (store_.SaveNote(current_note_)) {
+    if (current_note_.modified_utc <= 0 && document_.Length() == 0 && current_note_.title.empty()) {
         note_dirty_ = false;
+        SetStatusNotice(L"DRAFT EMPTY");
+        UpdateMainCaption();
+        InvalidateRect(launcher_hwnd_, nullptr, FALSE);
+        InvalidateRect(main_hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    SyncCurrentNoteFromDocument();
+    auto note_to_save = current_note_;
+    note_to_save.modified_utc = NowUtcSeconds();
+    if (store_.SaveNote(note_to_save)) {
+        current_note_ = std::move(note_to_save);
+        note_dirty_ = false;
+        SetStatusNotice(L"SAVED");
         RefreshRecentNotes();
         UpdateMainCaption();
         InvalidateRect(launcher_hwnd_, nullptr, FALSE);
+        InvalidateRect(main_hwnd_, nullptr, FALSE);
+    } else {
+        SetStatusNotice(L"SAVE FAILED");
         InvalidateRect(main_hwnd_, nullptr, FALSE);
     }
 }
@@ -1598,6 +2159,7 @@ void NoteApp::RefreshRecentNotes() {
 }
 
 void NoteApp::OpenNote(const std::wstring& id) {
+    CommitTitleEdit();
     SaveNow();
 
     NoteRecord loaded;
@@ -1611,6 +2173,12 @@ void NoteApp::OpenNote(const std::wstring& id) {
     note_dirty_ = false;
     scroll_y_ = 0.0f;
     preferred_caret_x_ = -1.0f;
+    title_editing_ = false;
+    title_selecting_ = false;
+    title_caret_ = current_note_.title.size();
+    title_anchor_ = title_caret_;
+    title_edit_text_.clear();
+    title_ime_preview_.clear();
     ime_preview_.clear();
     ime_dedup_chars_.clear();
     InvalidateLayout();
@@ -1625,6 +2193,7 @@ void NoteApp::OpenNote(const std::wstring& id) {
     ShowWindow(main_hwnd_, SW_SHOW);
     SetForegroundWindow(main_hwnd_);
     SetFocus(main_hwnd_);
+    SetStatusNotice(L"OPENED");
     UpdateImeWindow();
     ResetCaretBlink();
     InvalidateRect(main_hwnd_, nullptr, FALSE);
@@ -1632,13 +2201,20 @@ void NoteApp::OpenNote(const std::wstring& id) {
 }
 
 void NoteApp::CreateNewNote() {
+    CommitTitleEdit();
     SaveNow();
 
     current_note_ = store_.CreateNote();
     document_.Load(L"", {});
-    note_dirty_ = true;
+    note_dirty_ = false;
     scroll_y_ = 0.0f;
     preferred_caret_x_ = -1.0f;
+    title_editing_ = false;
+    title_selecting_ = false;
+    title_caret_ = 0;
+    title_anchor_ = 0;
+    title_edit_text_.clear();
+    title_ime_preview_.clear();
     ime_preview_.clear();
     ime_dedup_chars_.clear();
     InvalidateLayout();
@@ -1653,15 +2229,370 @@ void NoteApp::CreateNewNote() {
     ShowWindow(main_hwnd_, SW_SHOW);
     SetForegroundWindow(main_hwnd_);
     SetFocus(main_hwnd_);
-    SaveNow();
+    SetStatusNotice(L"NEW DRAFT");
     UpdateImeWindow();
     ResetCaretBlink();
     InvalidateRect(main_hwnd_, nullptr, FALSE);
+    InvalidateRect(launcher_hwnd_, nullptr, FALSE);
 }
 
 void NoteApp::SyncCurrentNoteFromDocument() {
     current_note_.text = document_.Text();
     current_note_.bold_ranges = document_.BoldRanges();
+}
+
+void NoteApp::BeginTitleEdit(float x_dip, float y_dip) {
+    if (!title_editing_) {
+        title_editing_ = true;
+        title_edit_text_ = current_note_.title;
+        title_ime_preview_.clear();
+        title_caret_ = title_edit_text_.size();
+        title_anchor_ = title_caret_;
+    }
+
+    if (x_dip >= 0.0f && y_dip >= 0.0f) {
+        SetTitleCaret(HitTestTitle(x_dip, y_dip), (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+    } else {
+        SetTitleCaret(title_edit_text_.size(), false);
+    }
+
+    ClearMainHover();
+    ResetCaretBlink();
+    UpdateImeWindow();
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+void NoteApp::CommitTitleEdit() {
+    if (!title_editing_) {
+        return;
+    }
+
+    const auto committed = NormalizeTitleForCommit(title_edit_text_);
+    const auto changed = committed != current_note_.title;
+    current_note_.title = committed;
+    title_editing_ = false;
+    title_selecting_ = false;
+    title_ime_preview_.clear();
+    title_edit_text_.clear();
+    title_caret_ = current_note_.title.size();
+    title_anchor_ = title_caret_;
+
+    if (changed) {
+        note_dirty_ = true;
+        ScheduleSave();
+        UpdateMainCaption();
+        SetStatusNotice(L"TITLE UPDATED", 900);
+        InvalidateRect(launcher_hwnd_, nullptr, FALSE);
+    }
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+void NoteApp::CancelTitleEdit() {
+    if (!title_editing_) {
+        return;
+    }
+
+    title_editing_ = false;
+    title_selecting_ = false;
+    title_ime_preview_.clear();
+    title_edit_text_.clear();
+    title_caret_ = current_note_.title.size();
+    title_anchor_ = title_caret_;
+    SetStatusNotice(L"TITLE CANCELED", 750);
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+void NoteApp::InsertTitleText(std::wstring_view text) {
+    if (!title_editing_ || text.empty()) {
+        return;
+    }
+
+    if (TitleHasSelection()) {
+        DeleteTitleSelection();
+    }
+
+    title_caret_ = std::min(title_caret_, title_edit_text_.size());
+    const auto available = kMaxTitleLength > title_edit_text_.size() ? kMaxTitleLength - title_edit_text_.size() : 0U;
+    auto clean = CleanTitleInput(text, available);
+    if (clean.empty()) {
+        return;
+    }
+
+    title_edit_text_.insert(title_caret_, clean);
+    title_caret_ += clean.size();
+    title_anchor_ = title_caret_;
+    title_ime_preview_.clear();
+    ResetCaretBlink();
+    UpdateImeWindow();
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+void NoteApp::DeleteTitleBackward() {
+    if (!title_editing_) {
+        return;
+    }
+
+    if (TitleHasSelection()) {
+        DeleteTitleSelection();
+    } else {
+        title_caret_ = std::min(title_caret_, title_edit_text_.size());
+        if (title_caret_ == 0) {
+            return;
+        }
+        title_edit_text_.erase(title_caret_ - 1U, 1U);
+        --title_caret_;
+        title_anchor_ = title_caret_;
+    }
+
+    title_ime_preview_.clear();
+    ResetCaretBlink();
+    UpdateImeWindow();
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+void NoteApp::DeleteTitleForward() {
+    if (!title_editing_) {
+        return;
+    }
+
+    if (TitleHasSelection()) {
+        DeleteTitleSelection();
+    } else {
+        title_caret_ = std::min(title_caret_, title_edit_text_.size());
+        if (title_caret_ >= title_edit_text_.size()) {
+            return;
+        }
+        title_edit_text_.erase(title_caret_, 1U);
+        title_anchor_ = title_caret_;
+    }
+
+    title_ime_preview_.clear();
+    ResetCaretBlink();
+    UpdateImeWindow();
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+void NoteApp::MoveTitleCaret(int direction, bool extend_selection) {
+    if (!title_editing_) {
+        return;
+    }
+
+    auto next = title_caret_;
+    if (direction < 0 && next > 0) {
+        --next;
+    } else if (direction > 0 && next < title_edit_text_.size()) {
+        ++next;
+    }
+
+    SetTitleCaret(next, extend_selection);
+    ResetCaretBlink();
+    UpdateImeWindow();
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+void NoteApp::SetTitleCaret(std::size_t position, bool extend_selection) {
+    title_caret_ = std::min(position, title_edit_text_.size());
+    if (!extend_selection) {
+        title_anchor_ = title_caret_;
+    }
+}
+
+void NoteApp::SelectTitleAll() {
+    if (!title_editing_) {
+        return;
+    }
+    title_anchor_ = 0;
+    title_caret_ = title_edit_text_.size();
+    title_ime_preview_.clear();
+    ResetCaretBlink();
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+bool NoteApp::CopyTitleSelectionToClipboard() {
+    if (!TitleHasSelection()) {
+        return false;
+    }
+    const auto start = TitleSelectionStart();
+    const auto selected = title_edit_text_.substr(start, TitleSelectionEnd() - start);
+    return SetClipboardText(main_hwnd_, selected);
+}
+
+bool NoteApp::CutTitleSelectionToClipboard() {
+    if (!CopyTitleSelectionToClipboard()) {
+        return false;
+    }
+    DeleteTitleSelection();
+    ResetCaretBlink();
+    UpdateImeWindow();
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+    return true;
+}
+
+bool NoteApp::PasteTitleFromClipboard() {
+    if (!OpenClipboard(main_hwnd_)) {
+        return false;
+    }
+
+    const auto handle = GetClipboardData(CF_UNICODETEXT);
+    if (!handle) {
+        CloseClipboard();
+        return false;
+    }
+
+    const auto* data = static_cast<const wchar_t*>(GlobalLock(handle));
+    if (!data) {
+        CloseClipboard();
+        return false;
+    }
+
+    const std::wstring text(data);
+    GlobalUnlock(handle);
+    CloseClipboard();
+
+    InsertTitleText(text);
+    return !text.empty();
+}
+
+bool NoteApp::TitleHasSelection() const {
+    return title_editing_ && title_anchor_ != title_caret_;
+}
+
+std::size_t NoteApp::TitleSelectionStart() const {
+    return std::min(title_anchor_, title_caret_);
+}
+
+std::size_t NoteApp::TitleSelectionEnd() const {
+    return std::max(title_anchor_, title_caret_);
+}
+
+void NoteApp::DeleteTitleSelection() {
+    if (!TitleHasSelection()) {
+        return;
+    }
+
+    const auto start = TitleSelectionStart();
+    const auto end = TitleSelectionEnd();
+    title_edit_text_.erase(start, end - start);
+    title_caret_ = start;
+    title_anchor_ = title_caret_;
+}
+
+std::size_t NoteApp::HitTestTitle(float x_dip, float y_dip) const {
+    if (!title_editing_) {
+        return current_note_.title.size();
+    }
+
+    const auto title_layout = CreateTitleLayout(title_edit_text_);
+    if (!title_layout) {
+        return title_edit_text_.size();
+    }
+
+    const auto layout = BuildMainChromeLayout();
+    const auto local_x = std::max(0.0f, x_dip - layout.title_text_rect.left);
+    const auto local_y = std::max(0.0f, y_dip - layout.title_text_rect.top);
+
+    BOOL trailing = FALSE;
+    BOOL inside = FALSE;
+    DWRITE_HIT_TEST_METRICS hit{};
+    title_layout->HitTestPoint(local_x, local_y, &trailing, &inside, &hit);
+    auto position = hit.textPosition + (trailing ? 1U : 0U);
+    position = std::min<std::uint32_t>(position, static_cast<std::uint32_t>(title_edit_text_.size()));
+    return static_cast<std::size_t>(position);
+}
+
+std::wstring NoteApp::TitleLayoutText() const {
+    std::wstring text = title_editing_ ? title_edit_text_ : current_note_.title;
+    if (title_editing_ && !title_ime_preview_.empty()) {
+        const auto insert_at = std::min(title_caret_, text.size());
+        text.insert(insert_at, title_ime_preview_);
+    }
+    return text;
+}
+
+Microsoft::WRL::ComPtr<IDWriteTextLayout> NoteApp::CreateTitleLayout(std::wstring_view text) const {
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+    if (!dwrite_factory_ || !section_format_) {
+        return layout;
+    }
+
+    const auto chrome = BuildMainChromeLayout();
+    const auto width = std::max(1.0f, chrome.title_text_rect.right - chrome.title_text_rect.left);
+    const auto height = std::max(1.0f, chrome.title_text_rect.bottom - chrome.title_text_rect.top);
+    const auto render_text = text.empty() ? std::wstring(L" ") : std::wstring(text);
+    dwrite_factory_->CreateTextLayout(render_text.c_str(), static_cast<UINT32>(render_text.size()),
+                                      section_format_.Get(), width, height, &layout);
+    return layout;
+}
+
+void NoteApp::RestoreMainWindow() {
+    if (!main_hwnd_) {
+        return;
+    }
+
+    if (current_note_.id.empty()) {
+        CreateNewNote();
+        return;
+    }
+
+    ToggleLauncherExpanded(false);
+    if (launcher_hwnd_) {
+        ShowWindow(launcher_hwnd_, SW_HIDE);
+    }
+
+    ShowWindow(main_hwnd_, IsIconic(main_hwnd_) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(main_hwnd_);
+    SetFocus(main_hwnd_);
+    SetStatusNotice(current_note_.modified_utc <= 0 ? L"DRAFT OPEN" : L"OPENED");
+    UpdateImeWindow();
+    ResetCaretBlink();
+    InvalidateRect(main_hwnd_, nullptr, FALSE);
+}
+
+bool NoteApp::HideMainToLauncher() {
+    CommitTitleEdit();
+    SaveNow();
+    if (note_dirty_) {
+        SetStatusNotice(L"SAVE FAILED");
+        InvalidateRect(main_hwnd_, nullptr, FALSE);
+        return false;
+    }
+
+    ClearMainHover();
+    ToggleHistoryDrawer(false);
+    ShowWindow(main_hwnd_, SW_HIDE);
+    if (launcher_hwnd_) {
+        RefreshRecentNotes();
+        ToggleLauncherExpanded(false);
+        ShowWindow(launcher_hwnd_, SW_SHOWNOACTIVATE);
+        InvalidateRect(launcher_hwnd_, nullptr, FALSE);
+    }
+    return true;
+}
+
+bool NoteApp::QuitApplication() {
+    if (quitting_) {
+        return true;
+    }
+
+    CommitTitleEdit();
+    SaveNow();
+    if (note_dirty_) {
+        RestoreMainWindow();
+        SetStatusNotice(L"SAVE FAILED");
+        return false;
+    }
+
+    quitting_ = true;
+    if (launcher_hwnd_) {
+        DestroyWindow(launcher_hwnd_);
+    } else if (main_hwnd_) {
+        DestroyWindow(main_hwnd_);
+        main_hwnd_ = nullptr;
+        PostQuitMessage(0);
+    } else {
+        PostQuitMessage(0);
+    }
+    return true;
 }
 
 void NoteApp::ToggleLauncherExpanded(bool expanded) {
@@ -1704,6 +2635,12 @@ void NoteApp::StartUiAnimation() {
     InvalidateRect(main_hwnd_, nullptr, FALSE);
 }
 
+void NoteApp::SetStatusNotice(std::wstring notice, ULONGLONG duration_ms) {
+    status_notice_ = std::move(notice);
+    status_notice_until_tick_ = GetTickCount64() + duration_ms;
+    StartUiAnimation();
+}
+
 void NoteApp::TickUiAnimation() {
     if (!main_hwnd_) {
         return;
@@ -1719,11 +2656,16 @@ void NoteApp::TickUiAnimation() {
     const auto old_drawer_progress = history_drawer_progress_;
     const auto old_delete_progress = pending_delete_progress_;
     const auto old_pressed_feedback_valid = pressed_feedback_valid_;
+    const auto old_status_visible = !status_notice_.empty();
     history_drawer_progress_ = MoveToward(history_drawer_progress_, history_drawer_target_, drawer_step);
     pending_delete_progress_ = MoveToward(pending_delete_progress_, pending_delete_target_, delete_step);
     if (pressed_feedback_valid_ && now >= pressed_feedback_until_tick_) {
         pressed_feedback_valid_ = false;
         pressed_feedback_payload_.clear();
+    }
+    if (!status_notice_.empty() && now >= status_notice_until_tick_) {
+        status_notice_.clear();
+        status_notice_until_tick_ = 0;
     }
 
     if (pending_delete_target_ == 0.0f && pending_delete_progress_ == 0.0f) {
@@ -1731,13 +2673,14 @@ void NoteApp::TickUiAnimation() {
     }
 
     const auto running = (history_drawer_progress_ != history_drawer_target_) ||
-                         (pending_delete_progress_ != pending_delete_target_) || pressed_feedback_valid_;
+                         (pending_delete_progress_ != pending_delete_target_) || pressed_feedback_valid_ ||
+                         !status_notice_.empty();
     if (!running) {
         KillTimer(main_hwnd_, kUiAnimationTimerId);
     }
 
     if (old_drawer_progress != history_drawer_progress_ || old_delete_progress != pending_delete_progress_ ||
-        old_pressed_feedback_valid != pressed_feedback_valid_) {
+        old_pressed_feedback_valid != pressed_feedback_valid_ || old_status_visible != !status_notice_.empty()) {
         InvalidateRect(main_hwnd_, nullptr, FALSE);
     }
 }
@@ -1779,6 +2722,7 @@ void NoteApp::DeleteNoteAndAdvance(const std::wstring& id) {
     if (!store_.DeleteNote(id)) {
         ClearDeleteConfirmation();
         RefreshRecentNotes();
+        SetStatusNotice(L"DELETE FAILED");
         InvalidateRect(main_hwnd_, nullptr, FALSE);
         return;
     }
@@ -1790,12 +2734,15 @@ void NoteApp::DeleteNoteAndAdvance(const std::wstring& id) {
         note_dirty_ = false;
         if (!recent_notes_.empty()) {
             OpenNote(recent_notes_.front().id);
+            SetStatusNotice(L"DELETED / OPENED NEXT");
         } else {
             CreateNewNote();
+            SetStatusNotice(L"DELETED / NEW DRAFT");
         }
         return;
     }
 
+    SetStatusNotice(L"DELETED");
     InvalidateRect(main_hwnd_, nullptr, FALSE);
 }
 
@@ -1878,7 +2825,7 @@ void NoteApp::UpdateMainCaption() {
         return;
     }
 
-    const auto title = NoteStore::DeriveTitle(document_.Text());
+    const auto title = NoteStore::DisplayTitle(current_note_.title);
     std::wstring caption = title + L"  |  RasterNoteNative";
     SetWindowTextW(main_hwnd_, caption.c_str());
 }
@@ -1900,6 +2847,9 @@ NoteApp::MainChromeLayout NoteApp::BuildMainChromeLayout() const {
     const auto inner_right = chrome_right - 16.0f;
     const auto row_top = chrome_top + 10.0f;
     constexpr float kControlGap = 6.0f;
+    constexpr float kTitleTop = 46.0f;
+    constexpr float kTitleHeight = 32.0f;
+    constexpr float kTitleActionWidth = 68.0f;
     constexpr float kEditorBandHeight = 28.0f;
     constexpr float kFooterBandHeight = 28.0f;
 
@@ -1910,6 +2860,9 @@ NoteApp::MainChromeLayout NoteApp::BuildMainChromeLayout() const {
     layout.control_band_rect = D2D1::RectF(chrome_left, chrome_top, chrome_right, chrome_top + 42.0f);
 
     auto button_right = inner_right;
+    layout.quit_button = D2D1::RectF(button_right - theme::kWindowControlWidth, row_top, button_right,
+                                     row_top + theme::kWindowControlHeight);
+    button_right = layout.quit_button.left - kControlGap;
     layout.close_button = D2D1::RectF(button_right - theme::kWindowControlWidth, row_top, button_right,
                                       row_top + theme::kWindowControlHeight);
     button_right = layout.close_button.left - kControlGap;
@@ -1931,13 +2884,29 @@ NoteApp::MainChromeLayout NoteApp::BuildMainChromeLayout() const {
     layout.new_button = D2D1::RectF(button_right - theme::kButtonWidth, row_top, button_right,
                                     row_top + theme::kButtonHeight);
 
+    if (title_editing_) {
+        auto title_action_right = inner_right;
+        layout.title_cancel_button =
+            D2D1::RectF(title_action_right - kTitleActionWidth, chrome_top + kTitleTop, title_action_right,
+                        chrome_top + kTitleTop + kTitleHeight);
+        title_action_right = layout.title_cancel_button.left - kControlGap;
+        layout.title_commit_button =
+            D2D1::RectF(title_action_right - theme::kButtonWidth, chrome_top + kTitleTop, title_action_right,
+                        chrome_top + kTitleTop + kTitleHeight);
+    }
+
     const auto utility_right = std::max(inner_left + 180.0f, layout.new_button.left - 16.0f);
-    const auto title_right = std::max(inner_left + 220.0f, layout.new_button.left - 16.0f);
+    const auto title_available_right = title_editing_ ? layout.title_commit_button.left - 10.0f : inner_right;
+    const auto title_right = std::max(inner_left + 220.0f, title_available_right);
     layout.utility_rect = D2D1::RectF(inner_left, row_top + 1.0f, utility_right, row_top + 16.0f);
-    layout.title_rect = D2D1::RectF(inner_left, chrome_top + 40.0f, title_right, chrome_top + 64.0f);
-    layout.subtitle_rect = D2D1::RectF(inner_left, chrome_top + 62.0f, title_right, chrome_bottom - 8.0f);
-    layout.toolbar_rect = D2D1::RectF(layout.new_button.left, layout.new_button.top, layout.close_button.right,
-                                      layout.close_button.bottom);
+    layout.title_rect =
+        D2D1::RectF(inner_left, chrome_top + kTitleTop, title_right, chrome_top + kTitleTop + kTitleHeight);
+    layout.title_text_rect = D2D1::RectF(layout.title_rect.left + 10.0f, layout.title_rect.top + 4.0f,
+                                         layout.title_rect.right - 10.0f, layout.title_rect.bottom - 3.0f);
+    layout.subtitle_rect = D2D1::RectF(inner_left, layout.title_rect.bottom + 10.0f, title_right,
+                                       chrome_bottom - 10.0f);
+    layout.toolbar_rect = D2D1::RectF(layout.new_button.left, layout.new_button.top, layout.quit_button.right,
+                                      layout.quit_button.bottom);
     layout.drag_rect = D2D1::RectF(inner_left, chrome_top, std::max(inner_left + 80.0f, layout.new_button.left - 12.0f),
                                    chrome_bottom);
 
@@ -2002,13 +2971,16 @@ LRESULT NoteApp::HitTestMainNc(POINT screen_point) const {
     }
 
     const auto layout = BuildMainChromeLayout();
+    if (Hit(layout.title_rect, point.x, point.y)) {
+        return HTCLIENT;
+    }
     if (Hit(layout.drag_rect, point.x, point.y)) {
         return HTCAPTION;
     }
     if (Hit(layout.minimize_button, point.x, point.y) || Hit(layout.maximize_button, point.x, point.y) ||
         Hit(layout.close_button, point.x, point.y) || Hit(layout.new_button, point.x, point.y) ||
         Hit(layout.bold_button, point.x, point.y) || Hit(layout.save_button, point.x, point.y) ||
-        Hit(layout.launcher_button, point.x, point.y)) {
+        Hit(layout.launcher_button, point.x, point.y) || Hit(layout.quit_button, point.x, point.y)) {
         return HTCLIENT;
     }
 
@@ -2069,9 +3041,20 @@ void NoteApp::ResetCursor(HWND hwnd, float x_dip, float y_dip) {
         return;
     }
 
+    const auto layout = BuildMainChromeLayout();
+    if (title_editing_ && (Hit(layout.title_commit_button, x_dip, y_dip) ||
+                           Hit(layout.title_cancel_button, x_dip, y_dip))) {
+        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        return;
+    }
+    if (Hit(layout.title_rect, x_dip, y_dip)) {
+        SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+        return;
+    }
+
     for (const auto& hit : main_hits_) {
         if (Hit(hit.rect, x_dip, y_dip)) {
-            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            SetCursor(LoadCursorW(nullptr, hit.role == HitRole::MainTitle ? IDC_IBEAM : IDC_HAND));
             return;
         }
     }
@@ -2190,6 +3173,28 @@ void NoteApp::HandleImeComposition(LPARAM lparam) {
 
     auto* context = ImmGetContext(main_hwnd_);
     if (!context) {
+        return;
+    }
+
+    if (title_editing_) {
+        if ((lparam & GCS_RESULTSTR) != 0) {
+            const auto result = ReadCompositionString(context, GCS_RESULTSTR);
+            title_ime_preview_.clear();
+            ime_dedup_chars_ = result;
+            ime_dedup_tick_ = GetTickCount64();
+            if (!result.empty()) {
+                InsertTitleText(result);
+            }
+        }
+
+        if ((lparam & GCS_COMPSTR) != 0) {
+            title_ime_preview_ = CleanTitleInput(ReadCompositionString(context, GCS_COMPSTR), kMaxTitleLength);
+            ResetCaretBlink();
+            UpdateImeWindow();
+            InvalidateRect(main_hwnd_, nullptr, FALSE);
+        }
+
+        ImmReleaseContext(main_hwnd_, context);
         return;
     }
 

@@ -5,7 +5,6 @@
 #include <windows.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -17,11 +16,6 @@ namespace raster {
 namespace {
 
 constexpr char kMagic[] = "RASTERNOTE/1";
-
-std::int64_t NowUtcSeconds() {
-    using namespace std::chrono;
-    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-}
 
 std::string WideToUtf8(std::wstring_view value) {
     if (value.empty()) {
@@ -150,6 +144,48 @@ std::vector<TextRange> ParseBoldRanges(std::string_view serialized) {
     return out;
 }
 
+std::string HexEncode(std::string_view value) {
+    constexpr char kDigits[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(value.size() * 2U);
+    for (const unsigned char ch : value) {
+        out.push_back(kDigits[(ch >> 4U) & 0x0F]);
+        out.push_back(kDigits[ch & 0x0F]);
+    }
+    return out;
+}
+
+std::string HexDecode(std::string_view value) {
+    auto nibble = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') {
+            return ch - '0';
+        }
+        if (ch >= 'A' && ch <= 'F') {
+            return ch - 'A' + 10;
+        }
+        if (ch >= 'a' && ch <= 'f') {
+            return ch - 'a' + 10;
+        }
+        return -1;
+    };
+
+    if ((value.size() % 2U) != 0U) {
+        return {};
+    }
+
+    std::string out;
+    out.reserve(value.size() / 2U);
+    for (std::size_t i = 0; i < value.size(); i += 2U) {
+        const auto high = nibble(value[i]);
+        const auto low = nibble(value[i + 1U]);
+        if (high < 0 || low < 0) {
+            return {};
+        }
+        out.push_back(static_cast<char>((high << 4) | low));
+    }
+    return out;
+}
+
 bool DeserializeRecord(const std::string& raw, NoteRecord& out) {
     const auto divider = raw.find("\n---\n");
     if (divider == std::string::npos) {
@@ -166,7 +202,9 @@ bool DeserializeRecord(const std::string& raw, NoteRecord& out) {
     }
 
     out.modified_utc = 0;
+    out.title.clear();
     out.bold_ranges.clear();
+    bool has_title = false;
 
     while (std::getline(lines, line)) {
         if (line.rfind("modified=", 0) == 0) {
@@ -177,10 +215,16 @@ bool DeserializeRecord(const std::string& raw, NoteRecord& out) {
             }
         } else if (line.rfind("bold=", 0) == 0) {
             out.bold_ranges = ParseBoldRanges(line.substr(5));
+        } else if (line.rfind("title=", 0) == 0) {
+            out.title = Utf8ToWide(HexDecode(line.substr(6)));
+            has_title = true;
         }
     }
 
     out.text = Utf8ToWide(body);
+    if (!has_title) {
+        out.title = NoteStore::DeriveTitle(out.text);
+    }
     return true;
 }
 
@@ -188,6 +232,7 @@ std::string SerializeRecord(const NoteRecord& note) {
     std::ostringstream out;
     out << kMagic << '\n';
     out << "modified=" << note.modified_utc << '\n';
+    out << "title=" << HexEncode(WideToUtf8(note.title)) << '\n';
     out << "bold=" << SerializeBoldRanges(note.bold_ranges) << '\n';
     out << "---\n";
     out << WideToUtf8(note.text);
@@ -218,7 +263,7 @@ bool NoteStore::Initialize() {
 NoteRecord NoteStore::CreateNote() const {
     NoteRecord note;
     note.id = MakeGuidString();
-    note.modified_utc = NowUtcSeconds();
+    note.title = L"";
     return note;
 }
 
@@ -312,7 +357,7 @@ std::vector<NoteSummary> NoteStore::ListRecentNotes(std::size_t limit) const {
 
             NoteSummary summary;
             summary.id = entry.path().stem().wstring();
-            summary.title = DeriveTitle(record.text);
+            summary.title = DisplayTitle(record.title);
             summary.preview = DerivePreview(record.text);
             summary.modified_utc = record.modified_utc;
             notes.push_back(std::move(summary));
@@ -354,6 +399,17 @@ std::wstring NoteStore::DeriveTitle(std::wstring_view text) {
     }
 
     return L"UNTITLED";
+}
+
+std::wstring NoteStore::DisplayTitle(std::wstring_view title) {
+    auto display = Trim(title);
+    if (display.empty()) {
+        return L"UNTITLED";
+    }
+    if (display.size() > 42) {
+        display.resize(42);
+    }
+    return display;
 }
 
 std::wstring NoteStore::PathFor(const std::wstring& id) const {

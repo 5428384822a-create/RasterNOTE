@@ -21,6 +21,7 @@ public:
 private:
     enum class HitRole {
         LauncherToggle,
+        LauncherResume,
         LauncherNew,
         LauncherQuit,
         LauncherNote,
@@ -28,9 +29,13 @@ private:
         MainBold,
         MainSave,
         MainLauncher,
+        MainTitle,
+        MainTitleCommit,
+        MainTitleCancel,
         MainMinimize,
         MainMaximize,
         MainClose,
+        MainQuit,
         MainHistoryNote,
         MainHistoryDelete,
         MainHistoryDeleteConfirm,
@@ -50,6 +55,9 @@ private:
         D2D1_RECT_F control_band_rect{};
         D2D1_RECT_F utility_rect{};
         D2D1_RECT_F title_rect{};
+        D2D1_RECT_F title_text_rect{};
+        D2D1_RECT_F title_commit_button{};
+        D2D1_RECT_F title_cancel_button{};
         D2D1_RECT_F subtitle_rect{};
         D2D1_RECT_F toolbar_rect{};
         D2D1_RECT_F drag_rect{};
@@ -60,6 +68,7 @@ private:
         D2D1_RECT_F minimize_button{};
         D2D1_RECT_F maximize_button{};
         D2D1_RECT_F close_button{};
+        D2D1_RECT_F quit_button{};
         D2D1_RECT_F editor_card_rect{};
         D2D1_RECT_F editor_band_rect{};
         D2D1_RECT_F footer_band_rect{};
@@ -94,6 +103,28 @@ private:
     void OpenNote(const std::wstring& id);
     void CreateNewNote();
     void SyncCurrentNoteFromDocument();
+    void RestoreMainWindow();
+    bool HideMainToLauncher();
+    bool QuitApplication();
+    void BeginTitleEdit(float x_dip = -1.0f, float y_dip = -1.0f);
+    void CommitTitleEdit();
+    void CancelTitleEdit();
+    void InsertTitleText(std::wstring_view text);
+    void DeleteTitleBackward();
+    void DeleteTitleForward();
+    void MoveTitleCaret(int direction, bool extend_selection);
+    void SetTitleCaret(std::size_t position, bool extend_selection);
+    void SelectTitleAll();
+    bool CopyTitleSelectionToClipboard();
+    bool CutTitleSelectionToClipboard();
+    bool PasteTitleFromClipboard();
+    [[nodiscard]] bool TitleHasSelection() const;
+    [[nodiscard]] std::size_t TitleSelectionStart() const;
+    [[nodiscard]] std::size_t TitleSelectionEnd() const;
+    void DeleteTitleSelection();
+    [[nodiscard]] std::size_t HitTestTitle(float x_dip, float y_dip) const;
+    [[nodiscard]] std::wstring TitleLayoutText() const;
+    [[nodiscard]] Microsoft::WRL::ComPtr<IDWriteTextLayout> CreateTitleLayout(std::wstring_view text) const;
     void ToggleLauncherExpanded(bool expanded);
     void ToggleHistoryDrawer(bool open);
     void UpdateMainCaption();
@@ -115,6 +146,7 @@ private:
     void ResetCaretBlink();
     void StartUiAnimation();
     void TickUiAnimation();
+    void SetStatusNotice(std::wstring notice, ULONGLONG duration_ms = 1600);
     void BeginDeleteConfirmation(const std::wstring& id);
     void ClearDeleteConfirmation();
     void DeleteNoteAndAdvance(const std::wstring& id);
@@ -157,13 +189,22 @@ private:
     std::wstring pending_delete_id_;
     std::wstring main_hover_payload_;
     std::wstring pressed_feedback_payload_;
+    std::wstring status_notice_;
     ULONGLONG ime_dedup_tick_ = 0;
     ULONGLONG animation_last_tick_ = 0;
     ULONGLONG pressed_feedback_until_tick_ = 0;
+    ULONGLONG status_notice_until_tick_ = 0;
     bool caret_visible_ = true;
     bool tracking_main_mouse_ = false;
     bool main_hover_valid_ = false;
     bool pressed_feedback_valid_ = false;
+    bool quitting_ = false;
+    bool title_editing_ = false;
+    bool title_selecting_ = false;
+    std::size_t title_caret_ = 0;
+    std::size_t title_anchor_ = 0;
+    std::wstring title_edit_text_;
+    std::wstring title_ime_preview_;
     HitRole main_hover_role_ = HitRole::LauncherToggle;
     HitRole pressed_feedback_role_ = HitRole::LauncherToggle;
     float history_drawer_progress_ = 0.0f;

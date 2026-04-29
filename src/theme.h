@@ -4,15 +4,15 @@
 
 namespace raster::theme {
 
-inline constexpr float kLauncherWidth = 360.0f;
-inline constexpr float kLauncherCollapsedHeight = 72.0f;
-inline constexpr float kLauncherExpandedHeight = 420.0f;
+inline constexpr float kLauncherWidth = 380.0f;
+inline constexpr float kLauncherCollapsedHeight = 132.0f;
+inline constexpr float kLauncherExpandedHeight = 480.0f;
 
 inline constexpr float kMainWidth = 1120.0f;
 inline constexpr float kMainHeight = 800.0f;
 
 inline constexpr float kOuterPadding = 18.0f;
-inline constexpr float kHeaderHeight = 92.0f;
+inline constexpr float kHeaderHeight = 112.0f;
 inline constexpr float kEditorPadding = 12.0f;
 inline constexpr float kButtonHeight = 24.0f;
 inline constexpr float kButtonWidth = 56.0f;
