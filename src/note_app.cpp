@@ -4,6 +4,7 @@
 
 #include <dwmapi.h>
 #include <imm.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +25,11 @@ constexpr wchar_t kMainClassName[] = L"RasterNoteNativeMainWindow";
 constexpr UINT_PTR kAutoSaveTimerId = 41;
 constexpr UINT_PTR kCaretBlinkTimerId = 42;
 constexpr UINT_PTR kUiAnimationTimerId = 43;
+constexpr UINT kTrayCallbackMessage = WM_APP + 31;
+constexpr UINT kTrayMenuOpen = 6001;
+constexpr UINT kTrayMenuNew = 6002;
+constexpr UINT kTrayMenuToggleLauncher = 6003;
+constexpr UINT kTrayMenuQuit = 6004;
 constexpr std::size_t kMaxTitleLength = 80;
 
 std::int64_t NowUtcSeconds() {
@@ -57,6 +63,45 @@ D2D1_COLOR_F BlendColor(const D2D1_COLOR_F& from, const D2D1_COLOR_F& to, float 
     const auto t = std::clamp(amount, 0.0f, 1.0f);
     return D2D1::ColorF(from.r + (to.r - from.r) * t, from.g + (to.g - from.g) * t, from.b + (to.b - from.b) * t,
                         from.a + (to.a - from.a) * t);
+}
+
+RECT WorkAreaForRect(const RECT& rect) {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (const auto monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST); GetMonitorInfoW(monitor, &info)) {
+        return info.rcWork;
+    }
+
+    RECT work_area{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
+    return work_area;
+}
+
+RECT DefaultLauncherRect(int width, int height) {
+    RECT work_area{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
+    const auto scale = static_cast<float>(GetDpiForSystem()) / 96.0f;
+    const auto margin = DipToPx(20.0f, scale);
+    return RECT{work_area.right - width - margin, work_area.top + margin,
+                work_area.right - margin, work_area.top + margin + height};
+}
+
+RECT ResizeRectFromNearestEdges(const RECT& current, int width, int height) {
+    const auto work_area = WorkAreaForRect(current);
+    const auto distance_left = std::abs(current.left - work_area.left);
+    const auto distance_right = std::abs(work_area.right - current.right);
+    const auto distance_top = std::abs(current.top - work_area.top);
+    const auto distance_bottom = std::abs(work_area.bottom - current.bottom);
+
+    auto left = distance_right < distance_left ? current.right - width : current.left;
+    auto top = distance_bottom < distance_top ? current.bottom - height : current.top;
+
+    const auto max_left = std::max(work_area.left, work_area.right - width);
+    const auto max_top = std::max(work_area.top, work_area.bottom - height);
+    left = std::clamp(left, work_area.left, max_left);
+    top = std::clamp(top, work_area.top, max_top);
+
+    return RECT{left, top, left + width, top + height};
 }
 
 bool EnsureRenderTarget(HWND hwnd, ID2D1Factory* factory,
@@ -301,6 +346,7 @@ bool NoteApp::Initialize(HINSTANCE instance, int show_command) {
     } else {
         CreateNewNote();
     }
+    AddTrayIcon();
 
     return true;
 }
@@ -477,14 +523,7 @@ LRESULT NoteApp::HandleLauncherMessage(UINT message, WPARAM wparam, LPARAM lpara
             return 0;
         case WM_NCHITTEST: {
             POINT screen_point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            const auto point = PointFromScreenDip(launcher_hwnd_, screen_point);
-            const auto size = ClientSizeDip(launcher_hwnd_);
-            const auto drag_right = launcher_expanded_ ? size.width - 116.0f : size.width - 16.0f;
-            const auto drag_bottom = launcher_expanded_ ? 46.0f : 30.0f;
-            if (point.x >= 8.0f && point.x <= drag_right && point.y >= 0.0f && point.y <= drag_bottom) {
-                return HTCAPTION;
-            }
-            return HTCLIENT;
+            return HitTestLauncherNc(screen_point);
         }
         case WM_ACTIVATE:
             if (LOWORD(wparam) == WA_INACTIVE && launcher_expanded_) {
@@ -577,11 +616,21 @@ LRESULT NoteApp::HandleMainMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         case WM_CLOSE:
             QuitApplication();
             return 0;
+        case WM_DESTROY:
+            RemoveTrayIcon();
+            return 0;
         case WM_SETFOCUS:
             StartCaretBlink();
             UpdateImeWindow();
             InvalidateRect(main_hwnd_, nullptr, FALSE);
             return 0;
+        case WM_COMMAND:
+            if (HandleTrayCommand(LOWORD(wparam))) {
+                return 0;
+            }
+            break;
+        case kTrayCallbackMessage:
+            return HandleTrayCallback(lparam);
         case WM_KILLFOCUS:
             CommitTitleEdit();
             StopCaretBlink();
@@ -2583,6 +2632,7 @@ bool NoteApp::QuitApplication() {
     }
 
     quitting_ = true;
+    RemoveTrayIcon();
     if (launcher_hwnd_) {
         DestroyWindow(launcher_hwnd_);
     } else if (main_hwnd_) {
@@ -2595,6 +2645,106 @@ bool NoteApp::QuitApplication() {
     return true;
 }
 
+bool NoteApp::AddTrayIcon() {
+    if (!main_hwnd_ || tray_icon_added_) {
+        return tray_icon_added_;
+    }
+
+    tray_icon_ = {};
+    tray_icon_.cbSize = sizeof(tray_icon_);
+    tray_icon_.hWnd = main_hwnd_;
+    tray_icon_.uID = 1;
+    tray_icon_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    tray_icon_.uCallbackMessage = kTrayCallbackMessage;
+    tray_icon_.hIcon = static_cast<HICON>(LoadImageW(nullptr, IDI_APPLICATION, IMAGE_ICON,
+                                                     GetSystemMetrics(SM_CXSMICON),
+                                                     GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+    if (!tray_icon_.hIcon) {
+        tray_icon_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    }
+    wcscpy_s(tray_icon_.szTip, L"RasterNoteNative");
+
+    tray_icon_added_ = Shell_NotifyIconW(NIM_ADD, &tray_icon_) != FALSE;
+    return tray_icon_added_;
+}
+
+void NoteApp::RemoveTrayIcon() {
+    if (!tray_icon_added_) {
+        return;
+    }
+
+    Shell_NotifyIconW(NIM_DELETE, &tray_icon_);
+    tray_icon_added_ = false;
+    tray_icon_ = {};
+}
+
+void NoteApp::ShowTrayMenu() {
+    if (!main_hwnd_) {
+        return;
+    }
+
+    const auto menu = CreatePopupMenu();
+    if (!menu) {
+        return;
+    }
+
+    const auto launcher_visible = launcher_hwnd_ && IsWindowVisible(launcher_hwnd_) != FALSE;
+    AppendMenuW(menu, MF_STRING, kTrayMenuOpen, L"Open RasterNote");
+    AppendMenuW(menu, MF_STRING, kTrayMenuNew, L"New Note");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kTrayMenuToggleLauncher, launcher_visible ? L"Hide Float" : L"Show Float");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kTrayMenuQuit, L"Quit");
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    SetForegroundWindow(main_hwnd_);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, main_hwnd_, nullptr);
+    PostMessageW(main_hwnd_, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+}
+
+LRESULT NoteApp::HandleTrayCallback(LPARAM lparam) {
+    switch (LOWORD(lparam)) {
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+            RestoreMainWindow();
+            return 0;
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
+            ShowTrayMenu();
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+bool NoteApp::HandleTrayCommand(UINT command_id) {
+    switch (command_id) {
+        case kTrayMenuOpen:
+            RestoreMainWindow();
+            return true;
+        case kTrayMenuNew:
+            CreateNewNote();
+            return true;
+        case kTrayMenuToggleLauncher:
+            if (launcher_hwnd_ && IsWindowVisible(launcher_hwnd_) != FALSE) {
+                ShowWindow(launcher_hwnd_, SW_HIDE);
+            } else if (launcher_hwnd_) {
+                RefreshRecentNotes();
+                ToggleLauncherExpanded(false);
+                ShowWindow(launcher_hwnd_, SW_SHOWNOACTIVATE);
+                InvalidateRect(launcher_hwnd_, nullptr, FALSE);
+            }
+            return true;
+        case kTrayMenuQuit:
+            QuitApplication();
+            return true;
+        default:
+            return false;
+    }
+}
+
 void NoteApp::ToggleLauncherExpanded(bool expanded) {
     if (!launcher_hwnd_) {
         return;
@@ -2602,16 +2752,59 @@ void NoteApp::ToggleLauncherExpanded(bool expanded) {
 
     launcher_expanded_ = expanded;
 
-    RECT work_area{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
     const auto scale = ScaleFor(launcher_hwnd_);
     const auto width = DipToPx(theme::kLauncherWidth, scale);
     const auto height = DipToPx(expanded ? theme::kLauncherExpandedHeight : theme::kLauncherCollapsedHeight, scale);
-    const auto margin = DipToPx(20.0f, scale);
+    RECT current{};
+    if (!GetWindowRect(launcher_hwnd_, &current)) {
+        current = DefaultLauncherRect(width, height);
+    }
 
-    SetWindowPos(launcher_hwnd_, HWND_TOPMOST, work_area.right - width - margin, work_area.top + margin, width,
-                 height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    const auto next = ResizeRectFromNearestEdges(current, width, height);
+    const auto show_flag = IsWindowVisible(launcher_hwnd_) != FALSE ? SWP_SHOWWINDOW : 0;
+    SetWindowPos(launcher_hwnd_, HWND_TOPMOST, next.left, next.top, next.right - next.left, next.bottom - next.top,
+                 show_flag | SWP_NOACTIVATE);
     InvalidateRect(launcher_hwnd_, nullptr, FALSE);
+}
+
+LRESULT NoteApp::HitTestLauncherNc(POINT screen_point) const {
+    if (!launcher_hwnd_) {
+        return HTNOWHERE;
+    }
+
+    const auto point = PointFromScreenDip(launcher_hwnd_, screen_point);
+    const auto size = ClientSizeDip(launcher_hwnd_);
+    if (point.x < 0.0f || point.y < 0.0f || point.x > size.width || point.y > size.height) {
+        return HTNOWHERE;
+    }
+
+    if (IsLauncherInteractivePoint(point.x, point.y)) {
+        return HTCLIENT;
+    }
+
+    const auto drag_bottom = launcher_expanded_ ? 70.0f : 44.0f;
+    if (point.x >= 8.0f && point.x <= size.width - 16.0f && point.y >= 0.0f && point.y <= drag_bottom) {
+        return HTCAPTION;
+    }
+    return HTCLIENT;
+}
+
+bool NoteApp::IsLauncherInteractivePoint(float x_dip, float y_dip) const {
+    for (const auto& hit : launcher_hits_) {
+        if (Hit(hit.rect, x_dip, y_dip)) {
+            return true;
+        }
+    }
+
+    if (!launcher_expanded_) {
+        return Hit(D2D1::RectF(92.0f, 14.0f, 140.0f, 38.0f), x_dip, y_dip) ||
+               Hit(D2D1::RectF(146.0f, 14.0f, 194.0f, 38.0f), x_dip, y_dip) ||
+               Hit(D2D1::RectF(200.0f, 14.0f, 240.0f, 38.0f), x_dip, y_dip) ||
+               Hit(D2D1::RectF(20.0f, 44.0f, theme::kLauncherWidth - 20.0f, 100.0f), x_dip, y_dip);
+    }
+
+    return Hit(D2D1::RectF(136.0f, 18.0f, 188.0f, 52.0f), x_dip, y_dip) ||
+           Hit(D2D1::RectF(194.0f, 18.0f, 240.0f, 52.0f), x_dip, y_dip);
 }
 
 void NoteApp::ToggleHistoryDrawer(bool open) {

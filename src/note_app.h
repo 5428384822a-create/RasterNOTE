@@ -6,6 +6,7 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <wrl/client.h>
 
 #include <string>
@@ -106,6 +107,11 @@ private:
     void RestoreMainWindow();
     bool HideMainToLauncher();
     bool QuitApplication();
+    bool AddTrayIcon();
+    void RemoveTrayIcon();
+    void ShowTrayMenu();
+    [[nodiscard]] LRESULT HandleTrayCallback(LPARAM lparam);
+    [[nodiscard]] bool HandleTrayCommand(UINT command_id);
     void BeginTitleEdit(float x_dip = -1.0f, float y_dip = -1.0f);
     void CommitTitleEdit();
     void CancelTitleEdit();
@@ -126,6 +132,8 @@ private:
     [[nodiscard]] std::wstring TitleLayoutText() const;
     [[nodiscard]] Microsoft::WRL::ComPtr<IDWriteTextLayout> CreateTitleLayout(std::wstring_view text) const;
     void ToggleLauncherExpanded(bool expanded);
+    [[nodiscard]] LRESULT HitTestLauncherNc(POINT screen_point) const;
+    [[nodiscard]] bool IsLauncherInteractivePoint(float x_dip, float y_dip) const;
     void ToggleHistoryDrawer(bool open);
     void UpdateMainCaption();
     void ApplyWindowStyle(HWND hwnd) const;
@@ -199,6 +207,7 @@ private:
     bool main_hover_valid_ = false;
     bool pressed_feedback_valid_ = false;
     bool quitting_ = false;
+    bool tray_icon_added_ = false;
     bool title_editing_ = false;
     bool title_selecting_ = false;
     std::size_t title_caret_ = 0;
@@ -211,6 +220,7 @@ private:
     float history_drawer_target_ = 0.0f;
     float pending_delete_progress_ = 0.0f;
     float pending_delete_target_ = 0.0f;
+    NOTIFYICONDATAW tray_icon_{};
 
     Microsoft::WRL::ComPtr<ID2D1Factory> d2d_factory_;
     Microsoft::WRL::ComPtr<IDWriteFactory> dwrite_factory_;
